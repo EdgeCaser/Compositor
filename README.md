@@ -54,6 +54,23 @@ model instead of remaining separate one-off servers.
 
 ## Run
 
+### Standalone executable (Windows)
+
+Download `compositor.exe` (or build it yourself, below) and double-click. It
+starts a local HTTP server on `http://127.0.0.1:8876/` and writes project
+data to a `projects/` folder next to the exe. Put the exe in a writable
+location (Downloads, Documents, or its own folder) -- not Program Files.
+
+Runtime requirements **not** bundled in the exe (the UI grays out features
+that need them):
+
+- [ffmpeg](https://ffmpeg.org/download.html) on PATH for chapter rendering.
+- [Claude Code CLI](https://docs.anthropic.com/claude-code) signed in to a
+  Pro/Max account for AI Attribution. The exe shells out to `claude -p` so
+  it uses your account's quota, not an API key.
+
+### From source
+
 Windows:
 
 ```bat
@@ -73,6 +90,61 @@ PYTHONPATH=src python -m compositor --open
 ```
 
 Then open `http://127.0.0.1:8876/`.
+
+### Verifying the download
+
+The Windows release publishes `compositor.exe.sha256` alongside the exe.
+Verify before running:
+
+```powershell
+# Windows
+certutil -hashfile compositor.exe SHA256
+# compare to the line printed in compositor.exe.sha256
+```
+
+```bash
+# macOS / Linux
+shasum -a 256 compositor.exe
+```
+
+The release page on GitHub also lists the canonical hash.
+
+### SmartScreen and antivirus warnings
+
+The exe is unsigned, so Windows SmartScreen will warn on first launch
+(`Don't run -> More info -> Run anyway`). PyInstaller onefile builds can also
+trip antivirus heuristics. If your AV flags it:
+
+- Microsoft Defender: submit the binary at
+  <https://www.microsoft.com/wdsi/filesubmission> so future reputation lookups
+  resolve clean.
+- For a multi-vendor scan, upload to <https://virustotal.com>.
+
+Code-signing the exe with an EV certificate would eliminate most of these
+warnings; doing so is on the roadmap for a 1.0 release.
+
+### Build the standalone exe yourself
+
+```bat
+packaging\build.bat        :: Windows
+packaging/build.sh         :: macOS / Linux
+```
+
+PyInstaller is installed automatically. Output lands at `dist/compositor.exe`
+(Windows) or `dist/compositor`, with a sibling `.sha256` file.
+
+### Cutting a release
+
+Tag and push:
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+The `.github/workflows/release.yml` workflow builds `compositor.exe` on a
+Windows runner, attaches the exe + SHA256, and opens a draft GitHub Release.
+Review the draft, then publish.
 
 ## Platform Notes
 

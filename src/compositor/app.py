@@ -18,8 +18,32 @@ from .project_store import ProjectStore
 from .review_yaml import yaml_error_payload
 from .secure_store import AppSettingsStore
 
-ROOT = Path(__file__).resolve().parents[2]
-STATIC_DIR = Path(__file__).resolve().parent / "web"
+def _runtime_root() -> Path:
+    """Where projects/ lives.
+
+    From source: repo root. Frozen exe: directory next to the exe so the
+    user can ship the .exe + projects/ folder together.
+    """
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parents[2]
+
+
+def _static_dir() -> Path:
+    """Where the bundled web/ assets live.
+
+    PyInstaller extracts --add-data files under ``sys._MEIPASS``; from
+    source they sit next to this module.
+    """
+    if getattr(sys, "frozen", False):
+        meipass = Path(getattr(sys, "_MEIPASS", "")) if getattr(sys, "_MEIPASS", None) else None
+        if meipass is not None:
+            return meipass / "compositor" / "web"
+    return Path(__file__).resolve().parent / "web"
+
+
+ROOT = _runtime_root()
+STATIC_DIR = _static_dir()
 STORE = ProjectStore(ROOT)
 SETTINGS = AppSettingsStore()
 ELEVENLABS = ElevenLabsService(SETTINGS)
