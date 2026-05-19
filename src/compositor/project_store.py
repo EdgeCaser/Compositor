@@ -4,8 +4,11 @@ import hashlib
 import json
 from pathlib import Path
 import shutil
+import threading
 
 from .actions import apply_dialogue_narration, apply_emotional_guidance, apply_voice_assignment, run_action
+from .chapter_render import RenderError, SegmentClip, render_chapter
+from .claude_cli import ClaudeCliError, extract_json_block, run_prompt
 from .docx_import import extract_docx_paragraphs
 from .models import new_project, now_iso, slugify
 from .performance_packets import (
@@ -28,273 +31,357 @@ class ProjectStore:
         self.repo_root = repo_root
         self.projects_dir = repo_root / "projects"
         self.projects_dir.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.RLock()
 
     def list_projects(self) -> list[dict]:
-        projects: list[dict] = []
-        for path in sorted(self.projects_dir.iterdir()):
-            state = path / "project.json"
-            if not state.exists():
-                continue
-            project = self._normalize_project(self._read_json(state))
-            projects.append(
-                {
-                    "id": project["id"],
-                    "name": project["name"],
-                    "updated_at": project.get("updated_at"),
-                    "chapters": len(project.get("chapters", [])),
-                    "review_files": len(project.get("review_files", [])),
-                    "performance_packets": len(project.get("performance_packets", [])),
-                    "jobs": len(project.get("jobs", [])),
-                }
-            )
-        return sorted(projects, key=lambda item: item.get("updated_at") or "", reverse=True)
+        with self._lock:
+            projects: list[dict] = []
+            for path in sorted(self.projects_dir.iterdir()):
+                state = path / "project.json"
+                if not state.exists():
+                    continue
+                project = self._normalize_project(self._read_json(state))
+                projects.append(
+                    {
+                        "id": project["id"],
+                        "name": project["name"],
+                        "updated_at": project.get("updated_at"),
+                        "chapters": len(project.get("chapters", [])),
+                        "review_files": len(project.get("review_files", [])),
+                        "performance_packets": len(project.get("performance_packets", [])),
+                        "jobs": len(project.get("jobs", [])),
+                    }
+                )
+            return sorted(projects, key=lambda item: item.get("updated_at") or "", reverse=True)
 
     def create_project(self, name: str) -> dict:
-        project_id = self._unique_project_id(slugify(name))
-        project = new_project(project_id, name)
-        project_dir = self.project_dir(project_id)
-        (project_dir / "source").mkdir(parents=True, exist_ok=True)
-        (project_dir / "review").mkdir(parents=True, exist_ok=True)
-        (project_dir / "packets").mkdir(parents=True, exist_ok=True)
-        (project_dir / "history").mkdir(parents=True, exist_ok=True)
-        self._save(project, "Created project")
-        return project
+        with self._lock:
+            project_id = self._unique_project_id(slugify(name))
+            project = new_project(project_id, name)
+            project_dir = self.project_dir(project_id)
+            (project_dir / "source").mkdir(parents=True, exist_ok=True)
+            (project_dir / "review").mkdir(parents=True, exist_ok=True)
+            (project_dir / "packets").mkdir(parents=True, exist_ok=True)
+            (project_dir / "history").mkdir(parents=True, exist_ok=True)
+            self._save(project, "Created project")
+            return project
 
     def load_project(self, project_id: str) -> dict:
-        state_path = self.project_dir(project_id) / "project.json"
-        if not state_path.exists():
-            raise FileNotFoundError(project_id)
-        return self._normalize_project(self._read_json(state_path))
+        with self._lock:
+            state_path = self.project_dir(project_id) / "project.json"
+            if not state_path.exists():
+                raise FileNotFoundError(project_id)
+            return self._normalize_project(self._read_json(state_path))
 
     def import_docx(self, *, project_id: str | None, name: str | None, source_path: str) -> dict:
-        if project_id:
-            project = self.load_project(project_id)
-        else:
-            if not name:
-                raise ValueError("name is required when creating a project from import")
-            project = self.create_project(name)
+        with self._lock:
+            if project_id:
+                project = self.load_project(project_id)
+            else:
+                if not name:
+                    raise ValueError("name is required when creating a project from import")
+                project = self.create_project(name)
 
-        src = Path(source_path).expanduser()
-        if not src.exists():
-            raise FileNotFoundError(source_path)
-        if src.suffix.lower() != ".docx":
-            raise ValueError("source_path must point to a .docx file")
+            src = Path(source_path).expanduser()
+            if not src.exists():
+                raise FileNotFoundError(source_path)
+            if src.suffix.lower() != ".docx":
+                raise ValueError("source_path must point to a .docx file")
 
-        project_dir = self.project_dir(project["id"])
-        source_dir = project_dir / "source"
-        source_dir.mkdir(parents=True, exist_ok=True)
-        copied_path = source_dir / self._unique_filename(source_dir, src.name)
-        shutil.copy2(src, copied_path)
+            project_dir = self.project_dir(project["id"])
+            source_dir = project_dir / "source"
+            source_dir.mkdir(parents=True, exist_ok=True)
+            copied_path = source_dir / self._unique_filename(source_dir, src.name)
+            shutil.copy2(src, copied_path)
 
-        paragraphs = extract_docx_paragraphs(copied_path)
-        chapter_id = self._unique_chapter_id(project, slugify(src.stem))
-        document_id = f"doc-{len(project.get('source_documents', [])) + 1}"
-        chapter = {
-            "id": chapter_id,
-            "title": src.stem,
-            "source_document_id": document_id,
-            "source_name": src.name,
-            "paragraphs": [
-                {
-                    "index": idx,
-                    "text": text,
-                    "kind": "narration",
-                    "guidance": "flat",
-                    "voice_slot": "narrator",
-                }
-                for idx, text in enumerate(paragraphs)
-            ],
-            "stats": {
-                "paragraphs": len(paragraphs),
-                "dialogue_paragraphs": 0,
-                "mixed_paragraphs": 0,
-                "narration_paragraphs": len(paragraphs),
-                "estimated_lines": 0,
-                "lines_read": 0,
-            },
-            "analysis": {},
-        }
-
-        apply_dialogue_narration(chapter)
-        apply_emotional_guidance(chapter)
-        apply_voice_assignment(chapter, project.get("cast", []))
-
-        project.setdefault("source_documents", []).append(
-            {
-                "id": document_id,
-                "name": src.name,
-                "copied_path": str(copied_path.relative_to(project_dir)),
-                "source_path": str(src),
-                "imported_at": now_iso(),
+            paragraphs = extract_docx_paragraphs(copied_path)
+            chapter_id = self._unique_chapter_id(project, slugify(src.stem))
+            document_id = f"doc-{len(project.get('source_documents', [])) + 1}"
+            chapter = {
+                "id": chapter_id,
+                "title": src.stem,
+                "source_document_id": document_id,
+                "source_name": src.name,
+                "paragraphs": [
+                    {
+                        "index": idx,
+                        "text": text,
+                        "kind": "narration",
+                        "guidance": "flat",
+                        "voice_slot": "narrator",
+                    }
+                    for idx, text in enumerate(paragraphs)
+                ],
+                "stats": {
+                    "paragraphs": len(paragraphs),
+                    "dialogue_paragraphs": 0,
+                    "mixed_paragraphs": 0,
+                    "narration_paragraphs": len(paragraphs),
+                    "estimated_lines": 0,
+                    "lines_read": 0,
+                },
+                "analysis": {},
             }
-        )
-        project.setdefault("chapters", []).append(chapter)
-        self._save(project, f"Imported {src.name}")
-        return project
+
+            apply_dialogue_narration(chapter)
+            apply_emotional_guidance(chapter)
+            apply_voice_assignment(chapter, project.get("cast", []))
+
+            project.setdefault("source_documents", []).append(
+                {
+                    "id": document_id,
+                    "name": src.name,
+                    "copied_path": str(copied_path.relative_to(project_dir)),
+                    "source_path": str(src),
+                    "imported_at": now_iso(),
+                }
+            )
+            project.setdefault("chapters", []).append(chapter)
+            self._save(project, f"Imported {src.name}")
+            return project
 
     def import_review_yaml(self, *, project_id: str | None, name: str | None, source_path: str) -> dict:
-        if project_id:
-            project = self.load_project(project_id)
-        else:
-            if not name:
-                raise ValueError("name is required when creating a project from import")
-            project = self.create_project(name)
+        with self._lock:
+            if project_id:
+                project = self.load_project(project_id)
+            else:
+                if not name:
+                    raise ValueError("name is required when creating a project from import")
+                project = self.create_project(name)
 
-        src = Path(source_path).expanduser()
-        if not src.exists():
-            raise FileNotFoundError(source_path)
-        if src.suffix.lower() not in {".yaml", ".yml"}:
-            raise ValueError("source_path must point to a YAML review file")
+            src = Path(source_path).expanduser()
+            if not src.exists():
+                raise FileNotFoundError(source_path)
+            if src.suffix.lower() not in {".yaml", ".yml"}:
+                raise ValueError("source_path must point to a YAML review file")
 
-        project_dir = self.project_dir(project["id"])
-        review_dir = project_dir / "review"
-        review_dir.mkdir(parents=True, exist_ok=True)
-        copied_path = review_dir / self._unique_filename(review_dir, src.name)
-        shutil.copy2(src, copied_path)
+            project_dir = self.project_dir(project["id"])
+            review_dir = project_dir / "review"
+            review_dir.mkdir(parents=True, exist_ok=True)
+            copied_path = review_dir / self._unique_filename(review_dir, src.name)
+            shutil.copy2(src, copied_path)
 
-        file_id = self._unique_review_id(project, slugify(src.stem))
-        project.setdefault("review_files", []).append(
-            {
-                "id": file_id,
-                "name": copied_path.name,
-                "copied_path": str(copied_path.relative_to(project_dir)),
-                "source_path": str(src),
-                "imported_at": now_iso(),
-            }
-        )
-        self._relink_packets_for_review(project, file_id, copied_path.name)
-        for packet in project.get("performance_packets", []):
-            if packet.get("review_name") == copied_path.name:
-                self._normalize_packet_review_paths(
-                    project,
-                    Path(str(packet.get("source_path") or "")).name or str(packet.get("name") or ""),
-                    str(packet.get("name") or ""),
-                    file_id,
-                )
-        self._save(project, f"Imported review {src.name}")
-        return project
+            file_id = self._unique_review_id(project, slugify(src.stem))
+            project.setdefault("review_files", []).append(
+                {
+                    "id": file_id,
+                    "name": copied_path.name,
+                    "copied_path": str(copied_path.relative_to(project_dir)),
+                    "source_path": str(src),
+                    "imported_at": now_iso(),
+                }
+            )
+            self._relink_packets_for_review(project, file_id, copied_path.name)
+            for packet in project.get("performance_packets", []):
+                if packet.get("review_name") == copied_path.name:
+                    self._normalize_packet_review_paths(
+                        project,
+                        Path(str(packet.get("source_path") or "")).name or str(packet.get("name") or ""),
+                        str(packet.get("name") or ""),
+                        file_id,
+                    )
+            self._save(project, f"Imported review {src.name}")
+            return project
 
     def import_performance_packet(self, *, project_id: str | None, name: str | None, source_path: str) -> dict:
-        if project_id:
-            project = self.load_project(project_id)
-        else:
-            if not name:
-                raise ValueError("name is required when creating a project from import")
-            project = self.create_project(name)
+        with self._lock:
+            if project_id:
+                project = self.load_project(project_id)
+            else:
+                if not name:
+                    raise ValueError("name is required when creating a project from import")
+                project = self.create_project(name)
 
-        src = Path(source_path).expanduser()
-        if not src.exists():
-            raise FileNotFoundError(source_path)
-        if not src.is_dir():
-            raise ValueError("source_path must point to a recording packet directory")
+            src = Path(source_path).expanduser()
+            if not src.exists():
+                raise FileNotFoundError(source_path)
+            if not src.is_dir():
+                raise ValueError("source_path must point to a recording packet directory")
 
-        shotlist = load_shotlist(src)
-        review_name = packet_review_name(shotlist)
+            shotlist = load_shotlist(src)
+            review_name = packet_review_name(shotlist)
 
-        project_dir = self.project_dir(project["id"])
-        packets_dir = project_dir / "packets"
-        packets_dir.mkdir(parents=True, exist_ok=True)
+            project_dir = self.project_dir(project["id"])
+            packets_dir = project_dir / "packets"
+            packets_dir.mkdir(parents=True, exist_ok=True)
 
-        copied_name = self._unique_dir_name(packets_dir, src.name)
-        copied_path = packets_dir / copied_name
-        shutil.copytree(src, copied_path)
+            copied_name = self._unique_dir_name(packets_dir, src.name)
+            copied_path = packets_dir / copied_name
+            shutil.copytree(src, copied_path)
 
-        src_audio_root = src.parent.parent if src.parent.parent.exists() else None
-        if src_audio_root is not None:
-            staging_src = src_audio_root / "_sts_staging" / src.name
-            perf_src = src_audio_root / "_performances" / src.name
-            if staging_src.exists() and staging_src.is_dir():
-                shutil.copytree(staging_src, copied_path / "staging")
-            if perf_src.exists() and perf_src.is_dir():
-                shutil.copytree(perf_src, copied_path / "performances")
+            src_audio_root = src.parent.parent if src.parent.parent.exists() else None
+            if src_audio_root is not None:
+                staging_src = src_audio_root / "_sts_staging" / src.name
+                perf_src = src_audio_root / "_performances" / src.name
+                if staging_src.exists() and staging_src.is_dir():
+                    shutil.copytree(staging_src, copied_path / "staging")
+                if perf_src.exists() and perf_src.is_dir():
+                    shutil.copytree(perf_src, copied_path / "performances")
 
-        packet_id = self._unique_packet_id(project, slugify(src.stem))
-        linked_review = self._resolve_review_file(project, review_name)
-        project.setdefault("performance_packets", []).append(
-            {
-                "id": packet_id,
-                "name": copied_name,
-                "review_name": review_name,
-                "linked_review_file_id": linked_review.get("id") if linked_review else None,
-                "copied_path": str(copied_path.relative_to(project_dir)),
-                "source_path": str(src),
-                "imported_at": now_iso(),
-            }
-        )
-        if linked_review is not None:
-            self._normalize_packet_review_paths(project, src.name, copied_name, linked_review["id"])
-        self._save(project, f"Imported packet {src.name}")
-        return project
+            packet_id = self._unique_packet_id(project, slugify(src.stem))
+            linked_review = self._resolve_review_file(project, review_name)
+            project.setdefault("performance_packets", []).append(
+                {
+                    "id": packet_id,
+                    "name": copied_name,
+                    "review_name": review_name,
+                    "linked_review_file_id": linked_review.get("id") if linked_review else None,
+                    "copied_path": str(copied_path.relative_to(project_dir)),
+                    "source_path": str(src),
+                    "imported_at": now_iso(),
+                }
+            )
+            if linked_review is not None:
+                self._normalize_packet_review_paths(project, src.name, copied_name, linked_review["id"])
+            self._save(project, f"Imported packet {src.name}")
+            return project
 
     def upsert_cast_voice(self, project_id: str, payload: dict) -> dict:
-        project = self.load_project(project_id)
-        slot = str(payload.get("slot", "")).strip()
-        if not slot:
-            raise ValueError("slot is required")
+        with self._lock:
+            project = self.load_project(project_id)
+            slot = str(payload.get("slot", "")).strip()
+            if not slot:
+                raise ValueError("slot is required")
 
-        cast = project.setdefault("cast", [])
-        existing = next((voice for voice in cast if voice.get("slot") == slot), None)
-        cleaned = {
-            "slot": slot,
-            "display_name": str(payload.get("display_name") or slot),
-            "voice_id": str(payload.get("voice_id") or ""),
-            "gain_db": float(payload.get("gain_db") or 0.0),
-            "role": str(payload.get("role") or "custom"),
-            "provider": str(payload.get("provider") or "elevenlabs"),
-            "provider_url": str(payload.get("provider_url") or ""),
-            "notes": str(payload.get("notes") or ""),
-        }
-        if existing is None:
-            cast.append(cleaned)
-            label = f"Added cast voice {slot}"
-        else:
-            existing.update(cleaned)
-            label = f"Updated cast voice {slot}"
-        self._save(project, label)
-        return project
+            cast = project.setdefault("cast", [])
+            existing = next((voice for voice in cast if voice.get("slot") == slot), None)
+            cleaned = {
+                "slot": slot,
+                "display_name": str(payload.get("display_name") or slot),
+                "voice_id": str(payload.get("voice_id") or ""),
+                "gain_db": float(payload.get("gain_db") or 0.0),
+                "role": str(payload.get("role") or "custom"),
+                "provider": str(payload.get("provider") or "elevenlabs"),
+                "provider_url": str(payload.get("provider_url") or ""),
+                "notes": str(payload.get("notes") or ""),
+            }
+            if existing is None:
+                cast.append(cleaned)
+                label = f"Added cast voice {slot}"
+            else:
+                existing.update(cleaned)
+                label = f"Updated cast voice {slot}"
+            self._save(project, label)
+            return project
+
+    def export_chapter_review_yaml(self, project_id: str, chapter_id: str) -> dict:
+        with self._lock:
+            project = self.load_project(project_id)
+            chapter = next((c for c in project.get("chapters", []) if c.get("id") == chapter_id), None)
+            if chapter is None:
+                raise ValueError(f"chapter not found: {chapter_id}")
+
+            if not chapter.get("analysis", {}).get("dialogue_narration"):
+                apply_dialogue_narration(chapter)
+            if not chapter.get("analysis", {}).get("guidance"):
+                apply_emotional_guidance(chapter)
+            if not chapter.get("analysis", {}).get("voice_assignment"):
+                apply_voice_assignment(chapter, project.get("cast", []))
+
+            narrator_slot = next(
+                (voice.get("slot", "narrator") for voice in project.get("cast", []) if voice.get("role") == "narrator"),
+                "narrator",
+            )
+            slots = self._project_voice_slots(project)
+
+            segments: list[dict] = []
+            seg_id = 0
+            for para in chapter.get("paragraphs", []):
+                text = (para.get("text") or "").strip()
+                if not text:
+                    continue
+                seg_id += 1
+                seg = {
+                    "id": seg_id,
+                    "kind": para.get("kind") or "narration",
+                    "voice": para.get("voice_slot") or narrator_slot,
+                    "text": text,
+                    "paragraph_idx": para.get("index"),
+                }
+                if para.get("guidance"):
+                    seg["mood"] = para.get("guidance")
+                if seg["kind"] == "dialogue":
+                    seg["attribution"] = "-"
+                segments.append(seg)
+
+            title = chapter.get("title") or chapter_id
+            doc = {
+                "source": chapter.get("source_name") or f"{title}.docx",
+                "output": f"{title}.mp3",
+                "narrator": narrator_slot,
+                "approved": False,
+                "voice_slots_available": slots,
+                "segments": segments,
+            }
+
+            project_dir = self.project_dir(project_id)
+            review_dir = project_dir / "review"
+            review_dir.mkdir(parents=True, exist_ok=True)
+            filename = self._unique_filename(review_dir, f"{title}.review.yaml")
+            out_path = review_dir / filename
+            out_path.write_text(dump_yaml_text(doc), encoding="utf-8", newline="\n")
+
+            file_id = self._unique_review_id(project, slugify(Path(filename).stem))
+            project.setdefault("review_files", []).append(
+                {
+                    "id": file_id,
+                    "name": out_path.name,
+                    "copied_path": str(out_path.relative_to(project_dir)),
+                    "source_path": "",
+                    "imported_at": now_iso(),
+                    "source_chapter_id": chapter_id,
+                }
+            )
+            self._relink_packets_for_review(project, file_id, out_path.name)
+            self._save(project, f"Exported review YAML from {chapter.get('title', chapter_id)}")
+            return {"project": project, "review_file_id": file_id, "name": out_path.name}
 
     def update_progress(self, project_id: str, chapter_id: str, lines_read: int) -> dict:
-        project = self.load_project(project_id)
-        chapter = next((item for item in project.get("chapters", []) if item.get("id") == chapter_id), None)
-        if chapter is None:
-            raise ValueError(f"chapter not found: {chapter_id}")
-        chapter.setdefault("stats", {})["lines_read"] = max(0, int(lines_read))
-        self._save(project, f"Updated progress for {chapter.get('title', chapter_id)}")
-        return project
+        with self._lock:
+            project = self.load_project(project_id)
+            chapter = next((item for item in project.get("chapters", []) if item.get("id") == chapter_id), None)
+            if chapter is None:
+                raise ValueError(f"chapter not found: {chapter_id}")
+            chapter.setdefault("stats", {})["lines_read"] = max(0, int(lines_read))
+            self._save(project, f"Updated progress for {chapter.get('title', chapter_id)}")
+            return project
 
     def run_action(self, project_id: str, chapter_id: str, action_id: str) -> dict:
-        project = self.load_project(project_id)
-        run_action(project, chapter_id, action_id)
-        self._save(project, f"Ran {action_id} on {chapter_id}")
-        return project
+        with self._lock:
+            project = self.load_project(project_id)
+            run_action(project, chapter_id, action_id)
+            self._save(project, f"Ran {action_id} on {chapter_id}")
+            return project
 
     def load_review_file(self, project_id: str, file_id: str) -> dict:
-        project = self.load_project(project_id)
-        meta = self._find_review_file(project, file_id)
-        path = self.project_dir(project_id) / meta["copied_path"]
-        text = path.read_text(encoding="utf-8")
-        sha256 = hashlib.sha256(text.encode("utf-8")).hexdigest()
-        try:
-            doc = parse_yaml_text(text)
-            preview = build_preview(doc, self._project_voice_slots(project))
-            parse_error = None
-        except Exception as exc:  # noqa: BLE001
-            preview = None
-            parse_error = yaml_error_payload(exc)
-        return {
-            "file": meta,
-            "path": str(path),
-            "text": text,
-            "sha256": sha256,
-            "mtime_ns": path.stat().st_mtime_ns,
-            "preview": preview,
-            "parse_error": parse_error,
-        }
+        with self._lock:
+            project = self.load_project(project_id)
+            meta = self._find_review_file(project, file_id)
+            path = self.project_dir(project_id) / meta["copied_path"]
+            text = path.read_text(encoding="utf-8")
+            sha256 = hashlib.sha256(text.encode("utf-8")).hexdigest()
+            try:
+                doc = parse_yaml_text(text)
+                preview = build_preview(doc, self._project_voice_slots(project))
+                parse_error = None
+            except Exception as exc:  # noqa: BLE001
+                preview = None
+                parse_error = yaml_error_payload(exc)
+            return {
+                "file": meta,
+                "path": str(path),
+                "text": text,
+                "sha256": sha256,
+                "mtime_ns": path.stat().st_mtime_ns,
+                "preview": preview,
+                "parse_error": parse_error,
+            }
 
     def preview_review_text(self, project_id: str, text: str) -> dict:
-        project = self.load_project(project_id)
-        doc = parse_yaml_text(text)
-        return build_preview(doc, self._project_voice_slots(project))
+        with self._lock:
+            project = self.load_project(project_id)
+            doc = parse_yaml_text(text)
+            return build_preview(doc, self._project_voice_slots(project))
 
     def set_review_segment_voice(
         self,
@@ -303,64 +390,347 @@ class ProjectStore:
         segment_id: int,
         voice: str,
     ) -> dict:
-        project = self.load_project(project_id)
-        voice = str(voice or "").strip()
-        if not voice:
-            raise ValueError("voice is required")
+        with self._lock:
+            project = self.load_project(project_id)
+            voice = str(voice or "").strip()
+            if not voice:
+                raise ValueError("voice is required")
 
-        doc = parse_yaml_text(text)
-        valid_slots = self._project_voice_slots(project) + list(doc.get("voice_slots_available") or [])
-        valid = list(dict.fromkeys([slot for slot in valid_slots if slot]))
-        if voice not in valid:
-            raise ValueError(f"Unknown voice slot: {voice}")
+            doc = parse_yaml_text(text)
+            valid_slots = self._project_voice_slots(project) + list(doc.get("voice_slots_available") or [])
+            valid = list(dict.fromkeys([slot for slot in valid_slots if slot]))
+            if voice not in valid:
+                raise ValueError(f"Unknown voice slot: {voice}")
 
-        target: dict | None = None
-        for segment in doc.get("segments", []):
-            if int(segment.get("id", -1)) == int(segment_id):
-                target = segment
-                break
-        if target is None:
-            raise FileNotFoundError(f"Segment id {segment_id} not found.")
-        if target.get("kind") == "pause":
-            raise ValueError("Pause segments do not have editable voice assignments.")
+            target: dict | None = None
+            for segment in doc.get("segments", []):
+                if int(segment.get("id", -1)) == int(segment_id):
+                    target = segment
+                    break
+            if target is None:
+                raise FileNotFoundError(f"Segment id {segment_id} not found.")
+            if target.get("kind") == "pause":
+                raise ValueError("Pause segments do not have editable voice assignments.")
 
-        cleared_performance = bool(target.get("performance"))
-        target["voice"] = voice
-        if target.get("kind") == "dialogue":
-            target["attribution"] = "manual"
-        if cleared_performance:
-            target.pop("performance", None)
+            cleared_performance = bool(target.get("performance"))
+            target["voice"] = voice
+            if target.get("kind") == "dialogue":
+                target["attribution"] = "manual"
+            if cleared_performance:
+                target.pop("performance", None)
 
-        preview = build_preview(doc, self._project_voice_slots(project))
-        updated_text = dump_yaml_text(doc)
-        return {
-            "text": updated_text,
-            "preview": preview,
-            "cleared_performance": cleared_performance,
-        }
+            preview = build_preview(doc, self._project_voice_slots(project))
+            updated_text = dump_yaml_text(doc)
+            return {
+                "text": updated_text,
+                "preview": preview,
+                "cleared_performance": cleared_performance,
+            }
+
+    def synthesize_review_segments(
+        self,
+        project_id: str,
+        file_id: str,
+        *,
+        synthesize_fn,
+        segment_ids: list[int] | None = None,
+    ) -> dict:
+        with self._lock:
+            project = self.load_project(project_id)
+            meta = self._find_review_file(project, file_id)
+            path = self.project_dir(project_id) / meta["copied_path"]
+            text = path.read_text(encoding="utf-8")
+            doc = parse_yaml_text(text)
+            segments = doc.get("segments") or []
+
+            slot_to_voice_id: dict[str, str] = {}
+            for voice in project.get("cast", []):
+                slot = str(voice.get("slot") or "").strip()
+                voice_id = str(voice.get("voice_id") or "").strip()
+                if slot and voice_id:
+                    slot_to_voice_id[slot] = voice_id
+
+            wanted = set(segment_ids) if segment_ids else None
+            targets: list[dict] = []
+            for seg in segments:
+                if seg.get("kind") == "pause":
+                    continue
+                seg_id = seg.get("id")
+                if wanted is not None and seg_id not in wanted:
+                    continue
+                if wanted is None and seg.get("performance"):
+                    continue
+                targets.append(seg)
+
+            if not targets:
+                return {
+                    "ok": True,
+                    "synthesized": [],
+                    "skipped": [],
+                    "errors": [],
+                    "text": text,
+                    "sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+                    "preview": build_preview(doc, self._project_voice_slots(project)),
+                }
+
+            project_dir = self.project_dir(project_id)
+            stem = Path(meta["name"]).stem
+            if stem.endswith(".review"):
+                stem = stem[: -len(".review")]
+            out_dir = project_dir / "rendered" / (stem or "chapter")
+            out_dir.mkdir(parents=True, exist_ok=True)
+
+            synthesized: list[dict] = []
+            skipped: list[dict] = []
+            errors: list[dict] = []
+
+            for seg in targets:
+                seg_id = seg.get("id")
+                slot = str(seg.get("voice") or "").strip()
+                seg_text = str(seg.get("text") or "").strip()
+                if not seg_text:
+                    skipped.append({"id": seg_id, "reason": "empty text"})
+                    continue
+                voice_id = slot_to_voice_id.get(slot)
+                if not voice_id:
+                    skipped.append({"id": seg_id, "reason": f"voice slot {slot!r} has no ElevenLabs voice_id assigned"})
+                    continue
+                filename = performance_filename(int(seg_id), slot, seg_text)
+                out_path = out_dir / filename
+                try:
+                    audio = synthesize_fn(voice_id, seg_text)
+                except Exception as exc:  # noqa: BLE001
+                    errors.append({"id": seg_id, "reason": str(exc)})
+                    continue
+                if not audio:
+                    errors.append({"id": seg_id, "reason": "ElevenLabs returned empty audio"})
+                    continue
+                out_path.write_bytes(audio)
+                relpath = (Path("rendered") / (stem or "chapter") / filename).as_posix()
+                seg["performance"] = relpath
+                synthesized.append({"id": seg_id, "path": relpath, "bytes": len(audio)})
+
+            new_text = dump_yaml_text(doc)
+            path.write_text(new_text, encoding="utf-8", newline="\n")
+            preview = build_preview(doc, self._project_voice_slots(project))
+            self._save(
+                project,
+                f"Synthesized {len(synthesized)} segment(s) in {meta['name']}",
+            )
+            return {
+                "ok": True,
+                "synthesized": synthesized,
+                "skipped": skipped,
+                "errors": errors,
+                "text": new_text,
+                "sha256": hashlib.sha256(new_text.encode("utf-8")).hexdigest(),
+                "preview": preview,
+            }
+
+    def render_review_chapter(self, project_id: str, file_id: str) -> dict:
+        with self._lock:
+            project = self.load_project(project_id)
+            meta = self._find_review_file(project, file_id)
+            project_dir = self.project_dir(project_id)
+            review_path = project_dir / meta["copied_path"]
+            doc = parse_yaml_text(review_path.read_text(encoding="utf-8"))
+            segments = doc.get("segments") or []
+
+            clips: list[SegmentClip] = []
+            missing: list[int] = []
+            for seg in segments:
+                seg_id = int(seg.get("id", -1))
+                kind = str(seg.get("kind") or "narration")
+                if kind == "pause":
+                    pause_ms = int(seg.get("pause_ms", 0) or 0)
+                    clips.append(SegmentClip(seg_id=seg_id, kind=kind, audio_path=None, pause_ms=pause_ms))
+                    continue
+                performance = str(seg.get("performance") or "").strip()
+                if not performance:
+                    missing.append(seg_id)
+                    continue
+                audio_path = project_dir / performance
+                if not audio_path.exists():
+                    missing.append(seg_id)
+                    continue
+                clips.append(SegmentClip(seg_id=seg_id, kind=kind, audio_path=audio_path))
+
+            if missing:
+                raise ValueError(
+                    f"Cannot render -- {len(missing)} segment(s) missing audio: {missing[:12]}"
+                    + (" ..." if len(missing) > 12 else "")
+                )
+            if not clips:
+                raise ValueError("review file has no segments to render")
+
+            stem = Path(meta["name"]).stem
+            if stem.endswith(".review"):
+                stem = stem[: -len(".review")]
+            output_name = str(doc.get("output") or "").strip() or f"{stem or 'chapter'}.mp3"
+            if not output_name.lower().endswith(".mp3"):
+                output_name = f"{output_name}.mp3"
+            out_dir = project_dir / "rendered"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            output_path = out_dir / output_name
+
+            try:
+                summary = render_chapter(clips, output_path)
+            except RenderError as exc:
+                raise ValueError(str(exc)) from exc
+
+            self._save(project, f"Rendered chapter {output_name}")
+            return {
+                "ok": True,
+                "path": str(output_path.relative_to(project_dir)).replace("\\", "/"),
+                "absolute_path": str(output_path),
+                "bytes": summary["bytes"],
+                "segments_rendered": summary["segments_rendered"],
+                "clips_total": summary["clips_total"],
+                "name": output_name,
+            }
+
+    def clear_review_segment_performance(self, project_id: str, file_id: str, segment_id: int) -> dict:
+        with self._lock:
+            project = self.load_project(project_id)
+            meta = self._find_review_file(project, file_id)
+            path = self.project_dir(project_id) / meta["copied_path"]
+            text = path.read_text(encoding="utf-8")
+            doc = parse_yaml_text(text)
+            target = self._find_review_segment(doc, segment_id)
+            if target is None:
+                raise FileNotFoundError(f"Segment id {segment_id} not found.")
+            cleared_path = target.pop("performance", None)
+            new_text = dump_yaml_text(doc)
+            path.write_text(new_text, encoding="utf-8", newline="\n")
+            preview = build_preview(doc, self._project_voice_slots(project))
+            self._save(project, f"Cleared performance on {meta['name']} segment {segment_id}")
+            return {
+                "ok": True,
+                "cleared": cleared_path,
+                "text": new_text,
+                "sha256": hashlib.sha256(new_text.encode("utf-8")).hexdigest(),
+                "preview": preview,
+            }
+
+    def attribute_review_dialogue(self, project_id: str, file_id: str) -> dict:
+        with self._lock:
+            project = self.load_project(project_id)
+            meta = self._find_review_file(project, file_id)
+            path = self.project_dir(project_id) / meta["copied_path"]
+            text = path.read_text(encoding="utf-8")
+            doc = parse_yaml_text(text)
+
+            segments = doc.get("segments") or []
+            candidate_kinds = {"dialogue", "mixed"}
+            needs: list[int] = []
+            for idx, seg in enumerate(segments):
+                if seg.get("kind") not in candidate_kinds:
+                    continue
+                attribution = seg.get("attribution")
+                if attribution in (None, "", "-"):
+                    needs.append(idx)
+            if not needs:
+                return {
+                    "ok": True,
+                    "updated": 0,
+                    "skipped": 0,
+                    "speakers": {},
+                    "text": text,
+                    "sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+                    "preview": build_preview(doc, self._project_voice_slots(project)),
+                }
+
+            lines = []
+            for seg in segments:
+                seg_id = seg.get("id")
+                kind = str(seg.get("kind") or "narration").upper()
+                body = str(seg.get("text") or "").strip().replace("\n", " ")
+                lines.append(f"[{seg_id}] {kind}: {body}")
+            passage = "\n".join(lines)
+
+            prompt = (
+                "You will analyze a passage of fiction to identify which character speaks each dialogue line.\n\n"
+                "Below is a numbered passage. Each segment is marked [N] where N is the segment ID. "
+                "NARRATION segments give context. DIALOGUE segments need attribution.\n\n"
+                "For each DIALOGUE segment, identify the speaker based on context (attribution tags like "
+                "\"Frank said\", pronoun antecedents, conversational patterns).\n\n"
+                "If the speaker is named, return that name. If clearly described but unnamed, return a brief "
+                "descriptor (e.g., \"the doctor\", \"young woman\"). If genuinely ambiguous, return \"unknown\".\n\n"
+                "Return ONLY a JSON object mapping segment ID (as string) to speaker (as string). No prose. "
+                "No code fences.\n\n"
+                f"PASSAGE:\n{passage}\n\nReturn JSON now:"
+            )
+
+            try:
+                raw = run_prompt(prompt)
+            except ClaudeCliError as exc:
+                raise ValueError(str(exc)) from exc
+
+            try:
+                speakers = extract_json_block(raw)
+            except (ValueError, json.JSONDecodeError) as exc:
+                raise ValueError(f"Could not parse Claude response as JSON: {raw[:200]}") from exc
+            if not isinstance(speakers, dict):
+                raise ValueError(f"Claude response was not a JSON object: {raw[:200]}")
+
+            updated = 0
+            skipped = 0
+            needs_ids = {segments[i].get("id") for i in needs}
+            for seg in segments:
+                seg_id = seg.get("id")
+                if seg_id not in needs_ids:
+                    continue
+                key = str(seg_id)
+                speaker = speakers.get(key)
+                if speaker and str(speaker).strip():
+                    seg["attribution"] = str(speaker).strip()
+                    updated += 1
+                else:
+                    if seg.get("attribution") in (None, "", "-"):
+                        seg["attribution"] = "-"
+                    skipped += 1
+
+            new_text = dump_yaml_text(doc)
+            path.write_text(new_text, encoding="utf-8", newline="\n")
+            preview = build_preview(doc, self._project_voice_slots(project))
+            self._save(project, f"AI attributed dialogue in {meta['name']}")
+            return {
+                "ok": True,
+                "updated": updated,
+                "skipped": skipped,
+                "speakers": {str(k): str(v) for k, v in speakers.items()},
+                "text": new_text,
+                "sha256": hashlib.sha256(new_text.encode("utf-8")).hexdigest(),
+                "preview": preview,
+            }
 
     def save_review_file(self, project_id: str, file_id: str, text: str, expected_sha256: str = "") -> dict:
-        project = self.load_project(project_id)
-        meta = self._find_review_file(project, file_id)
-        path = self.project_dir(project_id) / meta["copied_path"]
-        current_text = path.read_text(encoding="utf-8")
-        current_sha = hashlib.sha256(current_text.encode("utf-8")).hexdigest()
-        if expected_sha256 and current_sha != expected_sha256:
-            raise ValueError("File content on disk differs from what was loaded.")
+        with self._lock:
+            project = self.load_project(project_id)
+            meta = self._find_review_file(project, file_id)
+            path = self.project_dir(project_id) / meta["copied_path"]
+            current_text = path.read_text(encoding="utf-8")
+            current_sha = hashlib.sha256(current_text.encode("utf-8")).hexdigest()
+            if expected_sha256 and current_sha != expected_sha256:
+                raise ValueError("File content on disk differs from what was loaded.")
 
-        doc = parse_yaml_text(text)
-        preview = build_preview(doc, self._project_voice_slots(project))
-        path.write_text(text, encoding="utf-8", newline="\n")
-        self._save(project, f"Saved review {meta['name']}")
-        stat = path.stat()
-        return {
-            "name": meta["name"],
-            "mtime_ns": stat.st_mtime_ns,
-            "sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
-            "preview": preview,
-        }
+            doc = parse_yaml_text(text)
+            preview = build_preview(doc, self._project_voice_slots(project))
+            path.write_text(text, encoding="utf-8", newline="\n")
+            self._save(project, f"Saved review {meta['name']}")
+            stat = path.stat()
+            return {
+                "name": meta["name"],
+                "mtime_ns": stat.st_mtime_ns,
+                "sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+                "preview": preview,
+            }
 
     def load_performance_packet(self, project_id: str, packet_id: str) -> dict:
+        with self._lock:
+            return self._load_performance_packet_locked(project_id, packet_id)
+
+    def _load_performance_packet_locked(self, project_id: str, packet_id: str) -> dict:
         project = self.load_project(project_id)
         packet_meta = self._find_packet(project, packet_id)
         project_dir = self.project_dir(project_id)
@@ -448,12 +818,14 @@ class ProjectStore:
             if issue_flags:
                 counts["issues"] += 1
 
+            review_text = review_segment.get("text") if review_segment else None
+            display_text = entry.get("text") or review_text or ""
             segment_rows.append(
                 {
                     "segment_id": segment_id,
                     "paragraph_index": entry.get("paragraph_index"),
                     "chapter": entry.get("chapter"),
-                    "text": str(entry.get("text") or review_segment.get("text") if review_segment else entry.get("text") or ""),
+                    "text": str(display_text),
                     "rationale": entry.get("rationale"),
                     "direction_file": entry.get("direction_file"),
                     "status": status,
@@ -487,103 +859,106 @@ class ProjectStore:
         }
 
     def set_packet_segment_voice(self, project_id: str, packet_id: str, segment_id: int, voice: str) -> dict:
-        project = self.load_project(project_id)
-        packet_meta = self._find_packet(project, packet_id)
-        review_meta = self._resolve_packet_review(project, packet_meta, str(packet_meta.get("review_name") or ""))
-        if review_meta is None:
-            raise ValueError("No linked review YAML found for this packet.")
+        with self._lock:
+            project = self.load_project(project_id)
+            packet_meta = self._find_packet(project, packet_id)
+            review_meta = self._resolve_packet_review(project, packet_meta, str(packet_meta.get("review_name") or ""))
+            if review_meta is None:
+                raise ValueError("No linked review YAML found for this packet.")
 
-        project_dir = self.project_dir(project_id)
-        review_path = project_dir / review_meta["copied_path"]
-        shotlist_path = project_dir / packet_meta["copied_path"] / "shotlist.json"
+            project_dir = self.project_dir(project_id)
+            review_path = project_dir / review_meta["copied_path"]
+            shotlist_path = project_dir / packet_meta["copied_path"] / "shotlist.json"
 
-        doc = parse_yaml_text(review_path.read_text(encoding="utf-8"))
-        valid_slots = self._project_voice_slots(project) + list(doc.get("voice_slots_available") or [])
-        valid = list(dict.fromkeys([slot for slot in valid_slots if slot]))
-        if voice not in valid:
-            raise ValueError(f"Unknown voice slot: {voice}")
+            doc = parse_yaml_text(review_path.read_text(encoding="utf-8"))
+            valid_slots = self._project_voice_slots(project) + list(doc.get("voice_slots_available") or [])
+            valid = list(dict.fromkeys([slot for slot in valid_slots if slot]))
+            if voice not in valid:
+                raise ValueError(f"Unknown voice slot: {voice}")
 
-        target = self._find_review_segment(doc, segment_id)
-        if target is None:
-            raise FileNotFoundError(f"Segment id {segment_id} not found in linked review.")
-        if target.get("kind") == "pause":
-            raise ValueError("Pause segments do not have editable voice assignments.")
+            target = self._find_review_segment(doc, segment_id)
+            if target is None:
+                raise FileNotFoundError(f"Segment id {segment_id} not found in linked review.")
+            if target.get("kind") == "pause":
+                raise ValueError("Pause segments do not have editable voice assignments.")
 
-        target["voice"] = voice
-        if target.get("kind") == "dialogue":
-            target["attribution"] = "manual"
-        target.pop("performance", None)
-        build_preview(doc, self._project_voice_slots(project))
-        review_path.write_text(dump_yaml_text(doc), encoding="utf-8", newline="\n")
+            target["voice"] = voice
+            if target.get("kind") == "dialogue":
+                target["attribution"] = "manual"
+            target.pop("performance", None)
+            build_preview(doc, self._project_voice_slots(project))
+            review_path.write_text(dump_yaml_text(doc), encoding="utf-8", newline="\n")
 
-        shotlist = load_shotlist(shotlist_path.parent)
-        updated = False
-        for entry in shotlist:
-            if int(entry.get("segment_id") or -1) == int(segment_id):
-                entry["voice"] = voice
-                updated = True
-                break
-        if not updated:
-            raise FileNotFoundError(f"Segment id {segment_id} not found in shotlist.")
-        shotlist_path.write_text(json.dumps(shotlist, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            shotlist = load_shotlist(shotlist_path.parent)
+            updated = False
+            for entry in shotlist:
+                if int(entry.get("segment_id") or -1) == int(segment_id):
+                    entry["voice"] = voice
+                    updated = True
+                    break
+            if not updated:
+                raise FileNotFoundError(f"Segment id {segment_id} not found in shotlist.")
+            shotlist_path.write_text(json.dumps(shotlist, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
-        self._archive_active_generation(project_dir / packet_meta["copied_path"], segment_id)
-        self._save(project, f"Updated packet {packet_meta['name']} segment {segment_id} voice")
-        return self.load_performance_packet(project_id, packet_id)
+            self._archive_active_generation(project_dir / packet_meta["copied_path"], segment_id)
+            self._save(project, f"Updated packet {packet_meta['name']} segment {segment_id} voice")
+            return self.load_performance_packet(project_id, packet_id)
 
     def set_packet_segment_approval(self, project_id: str, packet_id: str, segment_id: int, approved: bool) -> dict:
-        project = self.load_project(project_id)
-        packet_meta = self._find_packet(project, packet_id)
-        review_meta = self._resolve_packet_review(project, packet_meta, str(packet_meta.get("review_name") or ""))
-        if review_meta is None:
-            raise ValueError("No linked review YAML found for this packet.")
+        with self._lock:
+            project = self.load_project(project_id)
+            packet_meta = self._find_packet(project, packet_id)
+            review_meta = self._resolve_packet_review(project, packet_meta, str(packet_meta.get("review_name") or ""))
+            if review_meta is None:
+                raise ValueError("No linked review YAML found for this packet.")
 
-        project_dir = self.project_dir(project_id)
-        packet_dir = project_dir / packet_meta["copied_path"]
-        paths = packet_paths(packet_dir)
-        review_path = project_dir / review_meta["copied_path"]
-        doc = parse_yaml_text(review_path.read_text(encoding="utf-8"))
-        target = self._find_review_segment(doc, segment_id)
-        if target is None:
-            raise FileNotFoundError(f"Segment id {segment_id} not found in linked review.")
+            project_dir = self.project_dir(project_id)
+            packet_dir = project_dir / packet_meta["copied_path"]
+            paths = packet_paths(packet_dir)
+            review_path = project_dir / review_meta["copied_path"]
+            doc = parse_yaml_text(review_path.read_text(encoding="utf-8"))
+            target = self._find_review_segment(doc, segment_id)
+            if target is None:
+                raise FileNotFoundError(f"Segment id {segment_id} not found in linked review.")
 
-        if approved:
-            perf_path = next(iter(performance_candidates(paths.performance_dir, segment_id)), None)
-            if perf_path is None:
-                gen_path = next((candidate for candidate in staging_gen_candidates(paths.staging_dir, segment_id) if candidate.exists()), None)
-                if gen_path is None:
-                    raise ValueError("No generated or performance file exists for this segment yet.")
-                ext = gen_path.suffix.lower() or ".mp3"
-                filename = performance_filename(segment_id, str(target.get("voice") or "voice"), str(target.get("text") or ""))
-                if ext != ".mp3":
-                    filename = Path(filename).with_suffix(ext).name
-                paths.performance_dir.mkdir(parents=True, exist_ok=True)
-                perf_path = paths.performance_dir / filename
-                shutil.copy2(gen_path, perf_path)
-            relpath = (Path(packet_meta["copied_path"]) / "performances" / perf_path.name).as_posix()
-            target["performance"] = relpath
-            label = f"Approved packet {packet_meta['name']} segment {segment_id}"
-        else:
-            target.pop("performance", None)
-            label = f"Cleared packet {packet_meta['name']} segment {segment_id} performance"
+            if approved:
+                perf_path = next(iter(performance_candidates(paths.performance_dir, segment_id)), None)
+                if perf_path is None:
+                    gen_path = next((candidate for candidate in staging_gen_candidates(paths.staging_dir, segment_id) if candidate.exists()), None)
+                    if gen_path is None:
+                        raise ValueError("No generated or performance file exists for this segment yet.")
+                    ext = gen_path.suffix.lower() or ".mp3"
+                    filename = performance_filename(segment_id, str(target.get("voice") or "voice"), str(target.get("text") or ""))
+                    if ext != ".mp3":
+                        filename = Path(filename).with_suffix(ext).name
+                    paths.performance_dir.mkdir(parents=True, exist_ok=True)
+                    perf_path = paths.performance_dir / filename
+                    shutil.copy2(gen_path, perf_path)
+                relpath = (Path(packet_meta["copied_path"]) / "performances" / perf_path.name).as_posix()
+                target["performance"] = relpath
+                label = f"Approved packet {packet_meta['name']} segment {segment_id}"
+            else:
+                target.pop("performance", None)
+                label = f"Cleared packet {packet_meta['name']} segment {segment_id} performance"
 
-        build_preview(doc, self._project_voice_slots(project))
-        review_path.write_text(dump_yaml_text(doc), encoding="utf-8", newline="\n")
-        self._save(project, label)
-        return self.load_performance_packet(project_id, packet_id)
+            build_preview(doc, self._project_voice_slots(project))
+            review_path.write_text(dump_yaml_text(doc), encoding="utf-8", newline="\n")
+            self._save(project, label)
+            return self.load_performance_packet(project_id, packet_id)
 
     def undo(self, project_id: str) -> dict:
-        project = self.load_project(project_id)
-        history = list(project.get("history", []))
-        if len(history) < 2:
-            raise ValueError("nothing to undo")
-        target = history[-2]
-        snapshot_path = self.project_dir(project_id) / target["snapshot_file"]
-        restored = self._normalize_project(self._read_json(snapshot_path))
-        self._restore_review_snapshot(project_id, target.get("review_snapshot_dir"))
-        self._restore_packet_snapshot(project_id, target.get("packet_snapshot_dir"))
-        self._write_project(restored)
-        return restored
+        with self._lock:
+            project = self.load_project(project_id)
+            history = list(project.get("history", []))
+            if len(history) < 2:
+                raise ValueError("nothing to undo")
+            target = history[-2]
+            snapshot_path = self.project_dir(project_id) / target["snapshot_file"]
+            restored = self._normalize_project(self._read_json(snapshot_path))
+            self._restore_review_snapshot(project_id, target.get("review_snapshot_dir"))
+            self._restore_packet_snapshot(project_id, target.get("packet_snapshot_dir"))
+            self._write_project(restored)
+            return restored
 
     def project_dir(self, project_id: str) -> Path:
         return self.projects_dir / project_id

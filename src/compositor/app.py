@@ -10,7 +10,10 @@ from urllib.parse import parse_qs, urlparse
 import webbrowser
 
 from .actions import list_actions
+from .chapter_render import is_available as ffmpeg_is_available
+from .claude_cli import is_available as claude_cli_is_available
 from .elevenlabs_client import ElevenLabsError, ElevenLabsService
+from .native_picker import PickerError, pick_directory, pick_file
 from .project_store import ProjectStore
 from .review_yaml import yaml_error_payload
 from .secure_store import AppSettingsStore
@@ -24,6 +27,16 @@ ELEVENLABS = ElevenLabsService(SETTINGS)
 
 def json_bytes(payload: dict | list) -> bytes:
     return json.dumps(payload, ensure_ascii=False).encode("utf-8")
+
+
+def _require_int(payload: dict, key: str) -> int:
+    value = payload.get(key)
+    if value is None:
+        raise ValueError(f"{key} is required")
+    try:
+        return int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{key} must be an integer") from exc
 
 
 class AppHandler(BaseHTTPRequestHandler):
@@ -42,6 +55,11 @@ class AppHandler(BaseHTTPRequestHandler):
             return self._json({"ok": True})
         if parsed.path == "/api/settings":
             return self._json(ELEVENLABS.public_settings())
+        if parsed.path == "/api/integrations":
+            return self._json({
+                "claude_cli": claude_cli_is_available(),
+                "ffmpeg": ffmpeg_is_available(),
+            })
         if parsed.path == "/api/providers/elevenlabs/voices":
             refresh = parse_qs(parsed.query or "").get("refresh", ["0"])[0] == "1"
             return self._handle_elevenlabs_voices(refresh=refresh)
@@ -55,9 +73,17 @@ class AppHandler(BaseHTTPRequestHandler):
             return self._handle_get_review_file(parts[2], parts[4])
         if len(parts) == 5 and parts[0] == "api" and parts[1] == "projects" and parts[3] == "packets":
             return self._handle_get_packet(parts[2], parts[4])
+        if len(parts) >= 5 and parts[0] == "api" and parts[1] == "projects" and parts[3] == "rendered":
+            return self._handle_get_rendered_file(parts[2], "/".join(parts[4:]))
         self.send_error(HTTPStatus.NOT_FOUND, "Not found")
 
     def do_POST(self) -> None:  # noqa: N802
+        try:
+            self._dispatch_post()
+        except ValueError as exc:
+            self._json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+
+    def _dispatch_post(self) -> None:
         parsed = urlparse(self.path)
         if parsed.path == "/api/projects":
             return self._handle_create_project()
@@ -71,6 +97,8 @@ class AppHandler(BaseHTTPRequestHandler):
             return self._handle_elevenlabs_settings()
         if parsed.path == "/api/settings/elevenlabs/clear":
             return self._handle_elevenlabs_clear()
+        if parsed.path == "/api/picker":
+            return self._handle_picker()
 
         parts = [part for part in parsed.path.split("/") if part]
         if len(parts) >= 3 and parts[0] == "api" and parts[1] == "projects":
@@ -87,12 +115,22 @@ class AppHandler(BaseHTTPRequestHandler):
                 return self._handle_review_segment_voice(project_id, parts[4])
             if len(parts) == 6 and parts[3] == "review-files" and parts[5] == "save":
                 return self._handle_review_save(project_id, parts[4])
+            if len(parts) == 6 and parts[3] == "review-files" and parts[5] == "attribute":
+                return self._handle_review_attribute(project_id, parts[4])
+            if len(parts) == 6 and parts[3] == "review-files" and parts[5] == "synthesize":
+                return self._handle_review_synthesize(project_id, parts[4])
+            if len(parts) == 6 and parts[3] == "review-files" and parts[5] == "clear-performance":
+                return self._handle_review_clear_performance(project_id, parts[4])
+            if len(parts) == 6 and parts[3] == "review-files" and parts[5] == "render":
+                return self._handle_review_render(project_id, parts[4])
             if len(parts) == 6 and parts[3] == "packets" and parts[5] == "segment-voice":
                 return self._handle_packet_segment_voice(project_id, parts[4])
             if len(parts) == 6 and parts[3] == "packets" and parts[5] == "performance":
                 return self._handle_packet_performance(project_id, parts[4])
             if len(parts) == 6 and parts[3] == "chapters" and parts[5] == "progress":
                 return self._handle_progress(project_id, parts[4])
+            if len(parts) == 6 and parts[3] == "chapters" and parts[5] == "export-review":
+                return self._handle_export_chapter_review(project_id, parts[4])
 
         self.send_error(HTTPStatus.NOT_FOUND, "Not found")
 
@@ -117,6 +155,31 @@ class AppHandler(BaseHTTPRequestHandler):
         except (FileNotFoundError, ValueError) as exc:
             return self._json({"error": str(exc)}, status=HTTPStatus.NOT_FOUND)
         self._json(payload)
+
+    def _handle_get_rendered_file(self, project_id: str, rel_path: str) -> None:
+        rendered_root = (ROOT / "projects" / project_id / "rendered").resolve()
+        try:
+            target = (rendered_root / rel_path).resolve()
+        except (OSError, ValueError):
+            return self.send_error(HTTPStatus.BAD_REQUEST, "Bad path")
+        if rendered_root not in target.parents and target != rendered_root:
+            return self.send_error(HTTPStatus.FORBIDDEN, "Path escapes rendered dir")
+        if not target.is_file():
+            return self.send_error(HTTPStatus.NOT_FOUND, "Rendered file not found")
+        suffix = target.suffix.lower()
+        content_type = {
+            ".mp3": "audio/mpeg",
+            ".wav": "audio/wav",
+            ".m4a": "audio/mp4",
+        }.get(suffix, "application/octet-stream")
+        payload = target.read_bytes()
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(payload)))
+        self.send_header("Accept-Ranges", "bytes")
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(payload)
 
     def _handle_get_packet(self, project_id: str, packet_id: str) -> None:
         try:
@@ -154,6 +217,22 @@ class AppHandler(BaseHTTPRequestHandler):
     def _handle_elevenlabs_clear(self) -> None:
         settings = ELEVENLABS.clear_api_key()
         self._json(settings)
+
+    def _handle_picker(self) -> None:
+        payload = self._read_json()
+        kind = str(payload.get("kind") or "").strip().lower()
+        try:
+            if kind == "docx":
+                path = pick_file("Select .docx source", [("Word documents", "*.docx")])
+            elif kind == "yaml":
+                path = pick_file("Select review YAML", [("YAML review", "*.yaml *.yml")])
+            elif kind == "packet":
+                path = pick_directory("Select recording packet directory")
+            else:
+                return self._json({"error": f"unknown picker kind: {kind}"}, status=HTTPStatus.BAD_REQUEST)
+        except PickerError as exc:
+            return self._json({"error": str(exc)}, status=HTTPStatus.BAD_GATEWAY)
+        self._json({"path": path})
 
     def _handle_import_docx(self) -> None:
         payload = self._read_json()
@@ -219,6 +298,13 @@ class AppHandler(BaseHTTPRequestHandler):
             return self._json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
         self._json({"project": project})
 
+    def _handle_export_chapter_review(self, project_id: str, chapter_id: str) -> None:
+        try:
+            result = STORE.export_chapter_review_yaml(project_id, chapter_id)
+        except (FileNotFoundError, ValueError) as exc:
+            return self._json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+        self._json({"ok": True, **result})
+
     def _handle_review_preview(self, project_id: str) -> None:
         payload = self._read_json()
         text = str(payload.get("text") or "")
@@ -230,16 +316,75 @@ class AppHandler(BaseHTTPRequestHandler):
 
     def _handle_review_segment_voice(self, project_id: str, file_id: str) -> None:
         payload = self._read_json()
+        segment_id = _require_int(payload, "segment_id")
         try:
             result = STORE.set_review_segment_voice(
                 project_id=project_id,
                 text=str(payload.get("text") or ""),
-                segment_id=int(payload.get("segment_id")),
+                segment_id=segment_id,
                 voice=str(payload.get("voice") or ""),
             )
         except (FileNotFoundError, ValueError) as exc:
             return self._json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
         self._json({"ok": True, "file_id": file_id, **result})
+
+    def _handle_review_attribute(self, project_id: str, file_id: str) -> None:
+        try:
+            result = STORE.attribute_review_dialogue(project_id, file_id)
+        except FileNotFoundError as exc:
+            return self._json({"error": str(exc)}, status=HTTPStatus.NOT_FOUND)
+        except ValueError as exc:
+            return self._json({"error": str(exc)}, status=HTTPStatus.BAD_GATEWAY)
+        self._json(result)
+
+    def _handle_review_synthesize(self, project_id: str, file_id: str) -> None:
+        if not SETTINGS.get_elevenlabs_api_key():
+            return self._json(
+                {"error": "ElevenLabs API key is not configured. Set it in the Cast tab."},
+                status=HTTPStatus.BAD_REQUEST,
+            )
+        payload = self._read_json()
+        raw_ids = payload.get("segment_ids")
+        segment_ids: list[int] | None = None
+        if isinstance(raw_ids, list) and raw_ids:
+            try:
+                segment_ids = [int(x) for x in raw_ids]
+            except (TypeError, ValueError):
+                return self._json({"error": "segment_ids must be a list of integers"}, status=HTTPStatus.BAD_REQUEST)
+        try:
+            result = STORE.synthesize_review_segments(
+                project_id,
+                file_id,
+                synthesize_fn=ELEVENLABS.synthesize,
+                segment_ids=segment_ids,
+            )
+        except FileNotFoundError as exc:
+            return self._json({"error": str(exc)}, status=HTTPStatus.NOT_FOUND)
+        except ValueError as exc:
+            return self._json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+        except ElevenLabsError as exc:
+            return self._json({"error": str(exc)}, status=HTTPStatus.BAD_GATEWAY)
+        self._json(result)
+
+    def _handle_review_render(self, project_id: str, file_id: str) -> None:
+        try:
+            result = STORE.render_review_chapter(project_id, file_id)
+        except FileNotFoundError as exc:
+            return self._json({"error": str(exc)}, status=HTTPStatus.NOT_FOUND)
+        except ValueError as exc:
+            return self._json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+        self._json(result)
+
+    def _handle_review_clear_performance(self, project_id: str, file_id: str) -> None:
+        payload = self._read_json()
+        segment_id = _require_int(payload, "segment_id")
+        try:
+            result = STORE.clear_review_segment_performance(project_id, file_id, segment_id)
+        except FileNotFoundError as exc:
+            return self._json({"error": str(exc)}, status=HTTPStatus.NOT_FOUND)
+        except ValueError as exc:
+            return self._json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+        self._json(result)
 
     def _handle_review_save(self, project_id: str, file_id: str) -> None:
         payload = self._read_json()
@@ -260,11 +405,12 @@ class AppHandler(BaseHTTPRequestHandler):
 
     def _handle_packet_segment_voice(self, project_id: str, packet_id: str) -> None:
         payload = self._read_json()
+        segment_id = _require_int(payload, "segment_id")
         try:
             packet = STORE.set_packet_segment_voice(
                 project_id=project_id,
                 packet_id=packet_id,
-                segment_id=int(payload.get("segment_id")),
+                segment_id=segment_id,
                 voice=str(payload.get("voice") or ""),
             )
             project = STORE.load_project(project_id)
@@ -274,11 +420,12 @@ class AppHandler(BaseHTTPRequestHandler):
 
     def _handle_packet_performance(self, project_id: str, packet_id: str) -> None:
         payload = self._read_json()
+        segment_id = _require_int(payload, "segment_id")
         try:
             packet = STORE.set_packet_segment_approval(
                 project_id=project_id,
                 packet_id=packet_id,
-                segment_id=int(payload.get("segment_id")),
+                segment_id=segment_id,
                 approved=bool(payload.get("approved")),
             )
             project = STORE.load_project(project_id)
@@ -297,9 +444,12 @@ class AppHandler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", "0"))
         body = self.rfile.read(length) if length else b"{}"
         try:
-            return json.loads(body.decode("utf-8") or "{}")
-        except json.JSONDecodeError:
-            return {}
+            payload = json.loads(body.decode("utf-8") or "{}")
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"invalid JSON body: {exc.msg} at line {exc.lineno} column {exc.colno}") from exc
+        if not isinstance(payload, dict):
+            raise ValueError("request body must be a JSON object")
+        return payload
 
     def _json(self, payload: dict | list, status: HTTPStatus = HTTPStatus.OK) -> None:
         raw = json_bytes(payload)

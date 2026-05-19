@@ -25,6 +25,11 @@ const state = {
       },
     },
   },
+  integrations: {
+    claude_cli: { available: false, version: null, error: null },
+    ffmpeg: { available: false, version: null, error: null },
+  },
+  renderedChapter: null,
   providerDialogOpen: false,
   providerForm: {
     api_key: "",
@@ -103,14 +108,16 @@ function syncProjectState(project) {
 
 async function boot() {
   try {
-    const [projectsPayload, actionsPayload, settingsPayload] = await Promise.all([
+    const [projectsPayload, actionsPayload, settingsPayload, integrationsPayload] = await Promise.all([
       api("/api/projects"),
       api("/api/actions"),
       api("/api/settings"),
+      api("/api/integrations"),
     ]);
     state.projects = projectsPayload.projects;
     state.actions = actionsPayload.actions;
     state.settings = settingsPayload;
+    state.integrations = integrationsPayload;
     if (state.projects.length && !state.project) {
       await loadProject(state.projects[0].id);
     } else {
@@ -125,6 +132,26 @@ async function boot() {
 async function refreshProjects() {
   const payload = await api("/api/projects");
   state.projects = payload.projects;
+}
+
+async function browsePath(kind, field) {
+  state.busy = true;
+  render();
+  try {
+    const payload = await api("/api/picker", {
+      method: "POST",
+      body: JSON.stringify({ kind }),
+    });
+    if (payload.path) {
+      state.importForm[field] = payload.path;
+      state.error = "";
+    }
+  } catch (error) {
+    state.error = error.message;
+  } finally {
+    state.busy = false;
+    render();
+  }
 }
 
 async function refreshSettings() {
@@ -486,6 +513,34 @@ async function runAction(actionId) {
   }
 }
 
+async function exportChapterReview(chapterId) {
+  if (!state.project || !chapterId) {
+    return;
+  }
+  state.busy = true;
+  render();
+  try {
+    const payload = await api(
+      `/api/projects/${encodeURIComponent(state.project.id)}/chapters/${encodeURIComponent(chapterId)}/export-review`,
+      { method: "POST", body: JSON.stringify({}) },
+    );
+    syncProjectState(payload.project);
+    await refreshProjects();
+    state.activeTab = "review";
+    state.reviewMode = "yaml";
+    if (payload.review_file_id) {
+      await loadReviewFile(payload.review_file_id);
+      return;
+    }
+    state.error = "";
+  } catch (error) {
+    state.error = error.message;
+  } finally {
+    state.busy = false;
+    render();
+  }
+}
+
 async function saveProgress(chapterId) {
   if (!state.project) {
     return;
@@ -593,6 +648,174 @@ async function changeReviewSegmentVoice(segmentId, voice) {
   } catch (error) {
     state.error = error.message;
   } finally {
+    state.busy = false;
+    render();
+  }
+}
+
+async function attributeReviewDialogue() {
+  if (!state.project || !state.activeReviewFileId) {
+    return;
+  }
+  if (state.reviewDirty) {
+    state.error = "Save your edits before running AI attribution -- it rewrites the saved file.";
+    render();
+    return;
+  }
+  state.busy = true;
+  render();
+  try {
+    const payload = await api(
+      `/api/projects/${encodeURIComponent(state.project.id)}/review-files/${encodeURIComponent(state.activeReviewFileId)}/attribute`,
+      { method: "POST", body: JSON.stringify({}) },
+    );
+    state.reviewText = payload.text;
+    state.reviewLoadedText = payload.text;
+    state.reviewSha = payload.sha256;
+    state.reviewPreview = payload.preview;
+    state.reviewParseError = null;
+    state.reviewDirty = false;
+    const projectPayload = await api(`/api/projects/${encodeURIComponent(state.project.id)}`);
+    syncProjectState(projectPayload.project);
+    await refreshProjects();
+    state.error = payload.updated
+      ? `AI attribution updated ${payload.updated} segment(s)${payload.skipped ? `; ${payload.skipped} left unresolved` : ""}.`
+      : "AI attribution ran but did not change any segments.";
+  } catch (error) {
+    state.error = error.message;
+  } finally {
+    state.busy = false;
+    render();
+  }
+}
+
+async function synthesizeReviewFile(segmentIds = null) {
+  if (!state.project || !state.activeReviewFileId) {
+    return;
+  }
+  if (state.reviewDirty) {
+    state.error = "Save your edits before synthesizing -- it rewrites the saved file.";
+    render();
+    return;
+  }
+  const provider = elevenlabsSettings();
+  if (!provider.configured) {
+    state.error = "Configure your ElevenLabs API key in the Cast tab first.";
+    state.activeTab = "cast";
+    render();
+    return;
+  }
+  if (!segmentIds) {
+    const pending = (state.reviewPreview?.segments || []).filter(
+      (s) => s.kind !== "pause" && !s.performance,
+    ).length;
+    if (pending === 0) {
+      state.error = "All non-pause segments already have a performance linked. Use Re-render on individual segments.";
+      render();
+      return;
+    }
+    if (!confirm(`Synthesize ${pending} segment(s) via ElevenLabs? This will draw against your account credits.`)) {
+      return;
+    }
+  }
+  state.busy = true;
+  state.error = "Synthesizing -- this can take a few seconds per segment...";
+  render();
+  try {
+    const payload = await api(
+      `/api/projects/${encodeURIComponent(state.project.id)}/review-files/${encodeURIComponent(state.activeReviewFileId)}/synthesize`,
+      {
+        method: "POST",
+        body: JSON.stringify(segmentIds ? { segment_ids: segmentIds } : {}),
+      },
+    );
+    state.reviewText = payload.text;
+    state.reviewLoadedText = payload.text;
+    state.reviewSha = payload.sha256;
+    state.reviewPreview = payload.preview;
+    state.reviewParseError = null;
+    state.reviewDirty = false;
+    const projectPayload = await api(`/api/projects/${encodeURIComponent(state.project.id)}`);
+    syncProjectState(projectPayload.project);
+    await refreshProjects();
+    const parts = [];
+    parts.push(`Synthesized ${payload.synthesized.length} segment(s)`);
+    if (payload.skipped.length) parts.push(`skipped ${payload.skipped.length}`);
+    if (payload.errors.length) parts.push(`errors ${payload.errors.length}`);
+    state.error = parts.join("; ") + ".";
+    if (payload.errors.length) {
+      console.warn("synthesis errors:", payload.errors);
+    }
+    if (payload.skipped.length) {
+      console.warn("synthesis skipped:", payload.skipped);
+    }
+  } catch (error) {
+    state.error = error.message;
+  } finally {
+    state.busy = false;
+    render();
+  }
+}
+
+async function renderReviewChapter() {
+  if (!state.project || !state.activeReviewFileId) {
+    return;
+  }
+  if (state.reviewDirty) {
+    state.error = "Save your edits before rendering.";
+    render();
+    return;
+  }
+  if (!state.integrations?.ffmpeg?.available) {
+    state.error = "ffmpeg not detected. Install it and restart the server.";
+    render();
+    return;
+  }
+  state.busy = true;
+  state.error = "Rendering chapter via ffmpeg...";
+  render();
+  try {
+    const payload = await api(
+      `/api/projects/${encodeURIComponent(state.project.id)}/review-files/${encodeURIComponent(state.activeReviewFileId)}/render`,
+      { method: "POST", body: JSON.stringify({}) },
+    );
+    state.renderedChapter = {
+      reviewFileId: state.activeReviewFileId,
+      name: payload.name,
+      path: payload.path,
+      bytes: payload.bytes,
+      segmentsRendered: payload.segments_rendered,
+      clipsTotal: payload.clips_total,
+      url: `/api/projects/${encodeURIComponent(state.project.id)}/rendered/${payload.path.split("/").map(encodeURIComponent).join("/")}?t=${Date.now()}`,
+    };
+    state.error = `Rendered ${payload.name} (${(payload.bytes / (1024 * 1024)).toFixed(2)} MB, ${payload.segments_rendered} segments).`;
+  } catch (error) {
+    state.error = error.message;
+  } finally {
+    state.busy = false;
+    render();
+  }
+}
+
+async function rerenderReviewSegment(segmentId) {
+  if (!state.project || !state.activeReviewFileId) {
+    return;
+  }
+  if (state.reviewDirty) {
+    state.error = "Save your edits before re-rendering.";
+    render();
+    return;
+  }
+  state.busy = true;
+  render();
+  try {
+    await api(
+      `/api/projects/${encodeURIComponent(state.project.id)}/review-files/${encodeURIComponent(state.activeReviewFileId)}/clear-performance`,
+      { method: "POST", body: JSON.stringify({ segment_id: segmentId }) },
+    );
+    await synthesizeReviewFile([segmentId]);
+  } catch (error) {
+    state.error = error.message;
     state.busy = false;
     render();
   }
@@ -823,7 +1046,10 @@ function renderImportTab() {
             <input value="${escapeHtml(state.importForm.name)}" oninput="state.importForm.name = this.value" placeholder="${state.project ? "Ignored while a project is selected" : "Cold Storage"}">
           </label>
           <label>Word doc path
-            <input value="${escapeHtml(state.importForm.source_path)}" oninput="state.importForm.source_path = this.value" placeholder="C:\\path\\to\\Chapter 1.docx">
+            <div class="path-picker">
+              <input value="${escapeHtml(state.importForm.source_path)}" oninput="state.importForm.source_path = this.value" placeholder="C:\\path\\to\\Chapter 1.docx">
+              <button type="button" class="ghost" onclick="browsePath('docx', 'source_path')">Browse...</button>
+            </div>
           </label>
           <button type="submit">${state.project ? "Import DOCX Into Current Project" : "Create Project From DOCX"}</button>
         </form>
@@ -831,14 +1057,17 @@ function renderImportTab() {
       <div class="import-grid">
         <div class="stack">
           <h3>Review YAML Import</h3>
-          <p class="muted">Bring in existing `.review.yaml` files so the real review workflow lives inside Compositor.</p>
+          <p class="muted">Bring in existing .review.yaml files so the real review workflow lives inside Compositor.</p>
         </div>
         <form class="stack" onsubmit="importReviewYaml(event)">
           <label>Project name
             <input value="${escapeHtml(state.importForm.name)}" oninput="state.importForm.name = this.value" placeholder="${state.project ? "Ignored while a project is selected" : "Cold Storage"}">
           </label>
           <label>Review YAML path
-            <input value="${escapeHtml(state.importForm.review_source_path)}" oninput="state.importForm.review_source_path = this.value" placeholder="C:\\path\\to\\06_Chapter 3.review.yaml">
+            <div class="path-picker">
+              <input value="${escapeHtml(state.importForm.review_source_path)}" oninput="state.importForm.review_source_path = this.value" placeholder="C:\\path\\to\\06_Chapter 3.review.yaml">
+              <button type="button" class="ghost" onclick="browsePath('yaml', 'review_source_path')">Browse...</button>
+            </div>
           </label>
           <button type="submit">${state.project ? "Import Review YAML" : "Create Project From Review YAML"}</button>
         </form>
@@ -853,7 +1082,10 @@ function renderImportTab() {
             <input value="${escapeHtml(state.importForm.name)}" oninput="state.importForm.name = this.value" placeholder="${state.project ? "Ignored while a project is selected" : "Cold Storage"}">
           </label>
           <label>Recording packet path
-            <input value="${escapeHtml(state.importForm.packet_source_path)}" oninput="state.importForm.packet_source_path = this.value" placeholder="C:\\path\\to\\06_Chapter 3">
+            <div class="path-picker">
+              <input value="${escapeHtml(state.importForm.packet_source_path)}" oninput="state.importForm.packet_source_path = this.value" placeholder="C:\\path\\to\\06_Chapter 3">
+              <button type="button" class="ghost" onclick="browsePath('packet', 'packet_source_path')">Browse...</button>
+            </div>
           </label>
           <button type="submit">${state.project ? "Import Recording Packet" : "Create Project From Packet"}</button>
         </form>
@@ -888,6 +1120,10 @@ function renderSourceReviewPanel(chapter) {
   `).join("");
   return `
     <div class="stack">
+      <div class="panel-actions">
+        <button type="button" onclick="exportChapterReview('${escapeHtml(chapter.id)}')">Generate Review YAML</button>
+        <span class="muted">Writes a .review.yaml from these heuristic-tagged paragraphs and opens it in the editor.</span>
+      </div>
       <div class="stats-grid">
         <div><strong>${chapter.stats.dialogue_paragraphs}</strong><span>Dialogue</span></div>
         <div><strong>${chapter.stats.mixed_paragraphs}</strong><span>Mixed</span></div>
@@ -918,6 +1154,7 @@ function renderReviewYamlPanel() {
   }
   const preview = state.reviewPreview;
   const parseError = state.reviewParseError;
+  const tts = elevenlabsSettings().configured;
   const segments = preview?.segments?.map((segment) => `
     <article class="review-segment ${escapeHtml(segment.kind)}">
       <header>
@@ -937,6 +1174,12 @@ function renderReviewYamlPanel() {
             </select>
           </label>
           <span class="muted">Attribution: ${escapeHtml(segment.attribution || "-")}</span>
+          ${tts && segment.performance
+            ? `<button type="button" class="ghost" onclick="rerenderReviewSegment(${segment.id})">Re-render</button>`
+            : ""}
+          ${tts && !segment.performance
+            ? `<button type="button" class="ghost" onclick="synthesizeReviewFile([${segment.id}])">Render</button>`
+            : ""}
         </div>
       `}
     </article>
@@ -952,6 +1195,15 @@ function renderReviewYamlPanel() {
         <div class="topbar-actions">
           <span class="review-status" data-review-status>${state.reviewDirty ? "Unsaved changes" : "Saved"}</span>
           <button class="ghost" onclick="previewReviewFile()">Validate</button>
+          ${state.integrations?.claude_cli?.available
+            ? `<button class="ghost" onclick="attributeReviewDialogue()" title="Uses your local Claude CLI session">AI Attribution</button>`
+            : `<button class="ghost" disabled title="${escapeHtml(state.integrations?.claude_cli?.error || "claude CLI not detected")}">AI Attribution</button>`}
+          ${elevenlabsSettings().configured
+            ? `<button class="ghost" onclick="synthesizeReviewFile()" title="Renders pending segments via ElevenLabs">Synthesize</button>`
+            : `<button class="ghost" disabled title="Configure ElevenLabs in the Cast tab to enable">Synthesize</button>`}
+          ${state.integrations?.ffmpeg?.available
+            ? `<button onclick="renderReviewChapter()" title="Stitch all segments + pauses into one mp3 via ffmpeg">Render Chapter</button>`
+            : `<button disabled title="${escapeHtml(state.integrations?.ffmpeg?.error || "ffmpeg not detected")}">Render Chapter</button>`}
           <button onclick="saveReviewFile()">Save YAML</button>
         </div>
       </div>
@@ -961,6 +1213,13 @@ function renderReviewYamlPanel() {
         <div><strong>Narrator:</strong> ${escapeHtml(preview?.narrator || "—")}</div>
         <div><strong>Segments:</strong> ${preview?.stats?.segments ?? "—"}</div>
       </div>
+      ${state.renderedChapter && state.renderedChapter.reviewFileId === state.activeReviewFileId ? `
+        <div class="message-strip ok">
+          <div><strong>Rendered:</strong> ${escapeHtml(state.renderedChapter.name)} (${(state.renderedChapter.bytes / (1024 * 1024)).toFixed(2)} MB)</div>
+          <audio controls src="${escapeHtml(state.renderedChapter.url)}" style="width:100%;margin-top:0.5rem"></audio>
+          <div><a class="button-link ghost" href="${escapeHtml(state.renderedChapter.url)}" download="${escapeHtml(state.renderedChapter.name)}">Download mp3</a></div>
+        </div>
+      ` : ""}
       ${parseError ? `
         <div class="message-strip error">
           Parse error: ${escapeHtml(parseError.message || "Invalid YAML")}
@@ -1394,6 +1653,7 @@ function render() {
 }
 
 window.loadProject = loadProject;
+window.browsePath = browsePath;
 window.createProject = createProject;
 window.importDocx = importDocx;
 window.importReviewYaml = importReviewYaml;
@@ -1407,6 +1667,7 @@ window.useAccountVoice = useAccountVoice;
 window.saveCastVoice = saveCastVoice;
 window.editVoice = editVoice;
 window.runAction = runAction;
+window.exportChapterReview = exportChapterReview;
 window.saveProgress = saveProgress;
 window.loadReviewFile = loadReviewFile;
 window.loadPerformancePacket = loadPerformancePacket;
@@ -1416,6 +1677,10 @@ window.changeReviewSegmentVoice = changeReviewSegmentVoice;
 window.changePacketSegmentVoice = changePacketSegmentVoice;
 window.togglePacketSegmentPerformance = togglePacketSegmentPerformance;
 window.saveReviewFile = saveReviewFile;
+window.attributeReviewDialogue = attributeReviewDialogue;
+window.synthesizeReviewFile = synthesizeReviewFile;
+window.rerenderReviewSegment = rerenderReviewSegment;
+window.renderReviewChapter = renderReviewChapter;
 window.undoProject = undoProject;
 window.selectTab = selectTab;
 window.selectChapter = selectChapter;

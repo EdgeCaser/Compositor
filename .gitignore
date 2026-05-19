@@ -10,3 +10,6 @@ projects/
 dist/
 build/
 *.log
+SESSION_HANDOFF.md
+session_handoff.md
+.claude/settings.local.json

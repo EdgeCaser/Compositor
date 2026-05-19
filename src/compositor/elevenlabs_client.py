@@ -77,6 +77,35 @@ class ElevenLabsClient:
             raise ElevenLabsError("ElevenLabs returned an unexpected response shape.")
         return payload
 
+    def synthesize(self, voice_id: str, text: str, *, model_id: str = "eleven_multilingual_v2") -> bytes:
+        if not voice_id:
+            raise ElevenLabsError("voice_id is required for synthesis")
+        if not text or not text.strip():
+            raise ElevenLabsError("text is required for synthesis")
+        url = f"{BASE_URL}/text-to-speech/{voice_id}"
+        body = json.dumps({"text": text, "model_id": model_id}).encode("utf-8")
+        req = request.Request(
+            url,
+            data=body,
+            method="POST",
+            headers={
+                "xi-api-key": self.api_key,
+                "Content-Type": "application/json",
+                "Accept": "audio/mpeg",
+                "User-Agent": "Compositor/0.4",
+            },
+        )
+        try:
+            with request.urlopen(req, timeout=120) as response:
+                return response.read()
+        except error.HTTPError as exc:
+            err_body = exc.read().decode("utf-8", errors="replace")
+            raise ElevenLabsError(f"ElevenLabs HTTP {exc.code}: {err_body[:240]}") from exc
+        except error.URLError as exc:
+            raise ElevenLabsError(f"ElevenLabs request failed: {exc.reason}") from exc
+        except OSError as exc:
+            raise ElevenLabsError(f"ElevenLabs request failed: {exc}") from exc
+
 
 class ElevenLabsService:
     def __init__(self, settings: AppSettingsStore) -> None:
@@ -125,3 +154,6 @@ class ElevenLabsService:
         if not api_key:
             raise ValueError("ElevenLabs API key is not configured.")
         return ElevenLabsClient(api_key=api_key)
+
+    def synthesize(self, voice_id: str, text: str) -> bytes:
+        return self._client().synthesize(voice_id, text)

@@ -101,6 +101,7 @@ button:disabled {
 .main {
   display: grid;
   gap: 1rem;
+  align-content: start;
 }
 
 .topbar,
@@ -383,6 +384,21 @@ textarea {
   gap: 0.75rem;
   flex-wrap: wrap;
   align-items: center;
+}
+
+.path-picker {
+  display: flex;
+  gap: 0.5rem;
+  align-items: stretch;
+}
+
+.path-picker input {
+  flex: 1;
+}
+
+.path-picker button {
+  flex: 0 0 auto;
+  white-space: nowrap;
 }
 
 table {

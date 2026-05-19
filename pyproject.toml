@@ -8,10 +8,24 @@ version = "0.1.0"
 description = "Local workstation for audiobook review, casting, and performance prep"
 readme = "README.md"
 requires-python = ">=3.11"
-dependencies = []
+dependencies = [
+    "pyyaml>=6",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7",
+]
 
 [project.scripts]
 compositor = "compositor.app:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers"
+markers = [
+    "ffmpeg: requires ffmpeg on PATH",
+]
 
 [tool.setuptools]
 package-dir = {"" = "src"}
