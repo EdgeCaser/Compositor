@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import subprocess
 import sys
+from pathlib import Path
 
 
 class PickerError(RuntimeError):
@@ -190,14 +191,116 @@ def _pick_dir_win32(title: str) -> str:
 # Public surface
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# macOS path (frozen exe on Darwin)
+# ---------------------------------------------------------------------------
+
+def _pick_file_osascript(title: str, filetypes: list[tuple[str, str]] | None) -> str:
+    """Native macOS picker via AppleScript -- works in any bundled app."""
+    import shutil as _shutil
+    if _shutil.which("osascript") is None:
+        raise PickerError("osascript not found")
+
+    of_type = ""
+    if filetypes:
+        exts: list[str] = []
+        for _, patterns in filetypes:
+            for pattern in patterns.replace(",", " ").split():
+                pattern = pattern.strip().lstrip("*").lstrip(".")
+                if pattern and pattern != "*":
+                    exts.append(pattern)
+        if exts:
+            of_type = " of type {" + ", ".join(f'"{e}"' for e in exts) + "}"
+
+    safe_title = (title or "Select a file").replace('"', "'")
+    script = f'POSIX path of (choose file{of_type} with prompt "{safe_title}")'
+    return _osascript(script)
+
+
+def _pick_dir_osascript(title: str) -> str:
+    import shutil as _shutil
+    if _shutil.which("osascript") is None:
+        raise PickerError("osascript not found")
+    safe_title = (title or "Select a folder").replace('"', "'")
+    return _osascript(f'POSIX path of (choose folder with prompt "{safe_title}")')
+
+
+def _osascript(script: str) -> str:
+    proc = subprocess.run(
+        ["osascript", "-e", script],
+        capture_output=True, text=True, check=False, timeout=600,
+    )
+    if proc.returncode != 0:
+        stderr = (proc.stderr or "").lower()
+        # User cancelled: AppleScript returns exit 1 with "User canceled."
+        if "user canceled" in stderr or "user cancelled" in stderr or "-128" in stderr:
+            return ""
+        raise PickerError((proc.stderr or "").strip() or "osascript failed")
+    return (proc.stdout or "").strip()
+
+
+# ---------------------------------------------------------------------------
+# Linux path (frozen exe on Linux)
+# ---------------------------------------------------------------------------
+
+def _pick_file_linux(title: str, filetypes: list[tuple[str, str]] | None) -> str:
+    import shutil as _shutil
+    if _shutil.which("zenity"):
+        args = ["zenity", "--file-selection", f"--title={title or 'Select a file'}"]
+        for label, patterns in filetypes or []:
+            pats = " ".join(p.strip() for p in patterns.replace(",", " ").split() if p.strip())
+            args.append(f"--file-filter={label} | {pats}")
+        return _run_linux_picker(args)
+    if _shutil.which("kdialog"):
+        ext_filter = ""
+        if filetypes:
+            chunks: list[str] = []
+            for label, patterns in filetypes:
+                pats = " ".join(patterns.replace(",", " ").split())
+                chunks.append(f"{pats}|{label}")
+            ext_filter = "\n".join(chunks)
+        args = ["kdialog", "--getopenfilename", str(Path.home())]
+        if ext_filter:
+            args.append(ext_filter)
+        if title:
+            args += ["--title", title]
+        return _run_linux_picker(args)
+    raise PickerError("install 'zenity' or 'kdialog' to use the native file picker")
+
+
+def _pick_dir_linux(title: str) -> str:
+    import shutil as _shutil
+    if _shutil.which("zenity"):
+        return _run_linux_picker(["zenity", "--file-selection", "--directory", f"--title={title or 'Select a folder'}"])
+    if _shutil.which("kdialog"):
+        args = ["kdialog", "--getexistingdirectory", str(Path.home())]
+        if title:
+            args += ["--title", title]
+        return _run_linux_picker(args)
+    raise PickerError("install 'zenity' or 'kdialog' to use the native folder picker")
+
+
+def _run_linux_picker(args: list[str]) -> str:
+    proc = subprocess.run(args, capture_output=True, text=True, check=False, timeout=600)
+    if proc.returncode == 0:
+        return (proc.stdout or "").strip()
+    if proc.returncode == 1 and not (proc.stderr or "").strip():
+        # zenity/kdialog return 1 on cancel without writing stderr.
+        return ""
+    raise PickerError((proc.stderr or "").strip() or f"picker exited {proc.returncode}")
+
+
+# ---------------------------------------------------------------------------
+# Public surface
+# ---------------------------------------------------------------------------
+
 def pick_file(title: str, filetypes: list[tuple[str, str]] | None = None) -> str:
     if _is_frozen():
         if sys.platform == "win32":
             return _pick_file_win32(title, filetypes)
-        raise PickerError(
-            "Native file picker is not available in the bundled build on this platform yet. "
-            "Paste the path manually for now."
-        )
+        if sys.platform == "darwin":
+            return _pick_file_osascript(title, filetypes)
+        return _pick_file_linux(title, filetypes)
     spec = "|".join(f"{label}:{patterns}" for label, patterns in (filetypes or []))
     return _run_subprocess(_FILE_SCRIPT, title, spec)
 
@@ -206,8 +309,7 @@ def pick_directory(title: str) -> str:
     if _is_frozen():
         if sys.platform == "win32":
             return _pick_dir_win32(title)
-        raise PickerError(
-            "Native folder picker is not available in the bundled build on this platform yet. "
-            "Paste the path manually for now."
-        )
+        if sys.platform == "darwin":
+            return _pick_dir_osascript(title)
+        return _pick_dir_linux(title)
     return _run_subprocess(_DIR_SCRIPT, title)

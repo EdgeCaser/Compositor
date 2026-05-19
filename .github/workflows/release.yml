@@ -1,0 +1,121 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag name to release (e.g. v0.1.0)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    name: Build Windows exe
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install build dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pyinstaller pyyaml
+
+      - name: Build exe
+        run: python -m PyInstaller packaging/compositor.spec --noconfirm --clean
+
+      - name: Compute SHA256
+        shell: pwsh
+        run: |
+          $hash = (Get-FileHash dist/compositor.exe -Algorithm SHA256).Hash.ToLower()
+          $size = (Get-Item dist/compositor.exe).Length
+          "$hash  compositor.exe" | Out-File -FilePath dist/compositor.exe.sha256 -Encoding ascii -NoNewline
+          Write-Host "SHA256: $hash"
+          Write-Host "Size:   $size bytes"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: compositor-windows
+          path: |
+            dist/compositor.exe
+            dist/compositor.exe.sha256
+          retention-days: 7
+
+  release:
+    name: Create GitHub Release
+    needs: [build-windows]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download Windows artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: compositor-windows
+          path: dist/windows
+
+      - name: Resolve tag name
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "name=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "name=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.name }}
+          name: Compositor ${{ steps.tag.outputs.name }}
+          draft: true
+          generate_release_notes: true
+          body: |
+            ## Downloads
+
+            - **Windows:** `compositor.exe` (unsigned). After download, verify the SHA256 against `compositor.exe.sha256`.
+            - **macOS / Linux:** build locally via `packaging/build.sh`. Pre-built binaries are not produced on CI yet.
+
+            ## Runtime requirements (not bundled)
+
+            - [ffmpeg](https://ffmpeg.org/download.html) on PATH -- needed for `Render Chapter`.
+            - [Claude Code CLI](https://docs.anthropic.com/claude-code) signed in to a Pro/Max account -- needed for `AI Attribution`. The exe shells out to your local `claude` so you draw from your account, not an API key.
+
+            ## Verifying the download
+
+            ```powershell
+            # Windows
+            certutil -hashfile compositor.exe SHA256
+            # compare the line that prints to compositor.exe.sha256
+            ```
+
+            ```bash
+            # macOS / Linux
+            shasum -a 256 compositor.exe
+            ```
+
+            ## SmartScreen / antivirus warnings
+
+            The exe is unsigned, so Windows SmartScreen will warn on first
+            launch (`Don't run -> More info -> Run anyway`). PyInstaller
+            onefile builds also occasionally trip antivirus heuristics. If
+            your AV flags it, submit the binary to:
+
+            - Microsoft: <https://www.microsoft.com/wdsi/filesubmission>
+            - VirusTotal (for a multi-vendor scan): <https://virustotal.com>
+          files: |
+            dist/windows/compositor.exe
+            dist/windows/compositor.exe.sha256

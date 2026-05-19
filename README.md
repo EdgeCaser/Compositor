@@ -91,6 +91,38 @@ PYTHONPATH=src python -m compositor --open
 
 Then open `http://127.0.0.1:8876/`.
 
+### Verifying the download
+
+The Windows release publishes `compositor.exe.sha256` alongside the exe.
+Verify before running:
+
+```powershell
+# Windows
+certutil -hashfile compositor.exe SHA256
+# compare to the line printed in compositor.exe.sha256
+```
+
+```bash
+# macOS / Linux
+shasum -a 256 compositor.exe
+```
+
+The release page on GitHub also lists the canonical hash.
+
+### SmartScreen and antivirus warnings
+
+The exe is unsigned, so Windows SmartScreen will warn on first launch
+(`Don't run -> More info -> Run anyway`). PyInstaller onefile builds can also
+trip antivirus heuristics. If your AV flags it:
+
+- Microsoft Defender: submit the binary at
+  <https://www.microsoft.com/wdsi/filesubmission> so future reputation lookups
+  resolve clean.
+- For a multi-vendor scan, upload to <https://virustotal.com>.
+
+Code-signing the exe with an EV certificate would eliminate most of these
+warnings; doing so is on the roadmap for a 1.0 release.
+
 ### Build the standalone exe yourself
 
 ```bat
@@ -99,7 +131,20 @@ packaging/build.sh         :: macOS / Linux
 ```
 
 PyInstaller is installed automatically. Output lands at `dist/compositor.exe`
-(Windows) or `dist/compositor`.
+(Windows) or `dist/compositor`, with a sibling `.sha256` file.
+
+### Cutting a release
+
+Tag and push:
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+The `.github/workflows/release.yml` workflow builds `compositor.exe` on a
+Windows runner, attaches the exe + SHA256, and opens a draft GitHub Release.
+Review the draft, then publish.
 
 ## Platform Notes
 
