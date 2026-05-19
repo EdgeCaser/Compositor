@@ -54,6 +54,23 @@ model instead of remaining separate one-off servers.
 
 ## Run
 
+### Standalone executable (Windows)
+
+Download `compositor.exe` (or build it yourself, below) and double-click. It
+starts a local HTTP server on `http://127.0.0.1:8876/` and writes project
+data to a `projects/` folder next to the exe. Put the exe in a writable
+location (Downloads, Documents, or its own folder) -- not Program Files.
+
+Runtime requirements **not** bundled in the exe (the UI grays out features
+that need them):
+
+- [ffmpeg](https://ffmpeg.org/download.html) on PATH for chapter rendering.
+- [Claude Code CLI](https://docs.anthropic.com/claude-code) signed in to a
+  Pro/Max account for AI Attribution. The exe shells out to `claude -p` so
+  it uses your account's quota, not an API key.
+
+### From source
+
 Windows:
 
 ```bat
@@ -73,6 +90,16 @@ PYTHONPATH=src python -m compositor --open
 ```
 
 Then open `http://127.0.0.1:8876/`.
+
+### Build the standalone exe yourself
+
+```bat
+packaging\build.bat        :: Windows
+packaging/build.sh         :: macOS / Linux
+```
+
+PyInstaller is installed automatically. Output lands at `dist/compositor.exe`
+(Windows) or `dist/compositor`.
 
 ## Platform Notes
 
